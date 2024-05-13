@@ -12,10 +12,7 @@ from stripedhyena.engine import HyenaInferenceEngine
 from stripedhyena.layers import ParallelGatedMLP, RMSNorm, VocabParallelEmbedding
 from stripedhyena.utils import column_split, print_rank_0
 
-try:
-    from flash_attn.modules.mha import MHA
-except ImportError:
-    "flash_attn not installed"
+from stripedhyena.custom_return_attn_mha import MHA
 
 try:
     from stripedhyena.positional_embeddings import swap_mha_rope
@@ -34,6 +31,7 @@ class AttentionBlock(nn.Module):
         mlp_dtype = config.get("mlp_dtype", torch.bfloat16)
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size_per_attention_head = config.hidden_size // config.num_attention_heads
+        self.return_attn_probs = config.return_attn_probs
 
         self.counter = 0
         self.inner_mha_cls = MHA(
@@ -43,10 +41,11 @@ class AttentionBlock(nn.Module):
             rotary_emb_dim=config.hidden_size // config.num_attention_heads,
             qkv_proj_bias=config.get("qkv_proj_bias", True),
             rotary_emb_base=config.get("rotary_emb_base", 10000),
-            causal=True,
+            causal=config.get("causal", True),
             layer_idx=layer_idx,
             out_proj_bias=config.get("mha_out_proj_bias", True),
             use_flash_attn=self.config.use_flash_attn,
+            return_attn_probs=config.return_attn_probs
         ).to(dtype=dtype)
 
         # check if using interpolated rotary pos emb from config, and swap the rope emb
@@ -68,18 +67,28 @@ class AttentionBlock(nn.Module):
         ):  # workaround for masking bug in FA. This works because Wqkv does not have bias
             # and attention scores will be also automatically zeroed.
             u = u * padding_mask[..., None]
-
-        u = (
-            self.inner_mha_cls(
-                self.pre_norm(u),
-                inference_params=inference_params,
+        if self.return_attn_probs:
+            u1, attn_probs = self.inner_mha_cls(
+                    self.pre_norm(u),
+                    inference_params=inference_params,
             )
-            + u
-        )
+            u = u + u1
+        else:
+            u = (
+                self.inner_mha_cls(
+                    self.pre_norm(u),
+                    inference_params=inference_params,
+                )
+                + u
+            )
         if type(padding_mask) == torch.Tensor:  # guard against bias
             u = u * padding_mask[..., None]
         u = self.mlp(self.post_norm(u)) + u
-        return u, None
+
+        if self.return_attn_probs:
+            return u, attn_probs
+        else:
+            return u, None
 
 
 class ParallelHyenaFilter(nn.Module):
@@ -336,10 +345,15 @@ def get_block(config, layer_idx, flash_fft=None):
 class StripedHyena(nn.Module):
     def __init__(self, config):
         super().__init__()
+
+        if 'causal' not in config:
+            config['causal'] = True
+        
         self.config = config
         self.embedding_layer = VocabParallelEmbedding(config)
         self.norm = RMSNorm(config) if config.get("final_norm", True) else None
         self.unembed = self.embedding_layer if config.tie_embeddings else VocabParallelEmbedding(config)
+        self.return_attn_probs = config.return_attn_probs
 
         if config.get("use_flashfft", "True"):
             try:
@@ -359,32 +373,67 @@ class StripedHyena(nn.Module):
         L = x.shape[1]
         x = self.embedding_layer.embed(x)
         if inference_params_dict is not None:
-            x, inference_params_dict_out = self.stateful_forward(
-                x,
-                inference_params_dict=inference_params_dict,
-            )
+            if self.return_attn_probs:
+                x, inference_params_dict_out, attn_probs = self.stateful_forward(
+                    x,
+                    inference_params_dict=inference_params_dict,
+                )
+            else:
+                x, inference_params_dict_out = self.stateful_forward(
+                    x,
+                    inference_params_dict=inference_params_dict,
+                )
         else:
-            x, inference_params_dict_out = self.stateless_forward(x, padding_mask=padding_mask)
+            if self.return_attn_probs:
+                x, inference_params_dict_out, attn_probs= self.stateless_forward(x, padding_mask=padding_mask)
+            else:
+                x, inference_params_dict_out = self.stateless_forward(x, padding_mask=padding_mask)
 
         x = self.norm(x)
         x = self.unembed.unembed(x)
-        return x, inference_params_dict_out
+        if self.return_attn_probs:
+            return x, inference_params_dict_out, attn_probs
+        else:
+            return x, inference_params_dict_out
 
     def stateful_forward(self, x, inference_params_dict=None):
-        for block_idx, block in enumerate(self.blocks):
-            block_name = "mha" if block_idx in self.config.attn_layer_idxs else "hyena"
-            inference_params = inference_params_dict[block_name]
-            x, _ = block(x, inference_params=inference_params)
+        if self.return_attn_probs:
+            attn_list = []
+            for block_idx, block in enumerate(self.blocks):
+                block_name = "mha" if block_idx in self.config.attn_layer_idxs else "hyena"
+                inference_params = inference_params_dict[block_name]
+                if block_name == "mha":
+                    x, _, attn_probs = block(x, inference_params=inference_params)
+                    attn_list.append(attn_probs)
+                else:
+                    x, _ = block(x, inference_params=inference_params)
 
-        return x, inference_params_dict
+            return x, inference_params_dict, attn_list
+        else:
+            for block_idx, block in enumerate(self.blocks):
+                block_name = "mha" if block_idx in self.config.attn_layer_idxs else "hyena"
+                inference_params = inference_params_dict[block_name]
+                x, _ = block(x, inference_params=inference_params)
+
+            return x, inference_params_dict
 
     def stateless_forward(self, x, padding_mask=None):
         if type(padding_mask) == torch.Tensor:
             x = x * padding_mask[..., None]
 
-        for _, block in enumerate(self.blocks):
-            x, _ = block(x, inference_params=None, padding_mask=padding_mask)
-        return x, None
+        if self.return_attn_probs:
+            attn_list = []
+            for block_idx, block in enumerate(self.blocks):
+                if block_idx in self.config.attn_layer_idxs:
+                    x, attns = block(x, inference_params=None, padding_mask=padding_mask)
+                    attn_list.append(attns)
+                else:
+                    x, _ = block(x, inference_params=None, padding_mask=padding_mask)
+            return x, None, attn_list
+        else:
+            for _, block in enumerate(self.blocks):
+                x, _ = block(x, inference_params=None, padding_mask=padding_mask)
+            return x, None
 
     def initialize_inference_params(self):
         inference_params_dict = {
